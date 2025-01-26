@@ -72,7 +72,7 @@ def init_model(
     crop_size=224,
     pred_depth=6,
     pred_emb_dim=384
-):
+) -> tuple[torch.nn.Module, torch.nn.Module, torch.nn.Module]:
     encoder = vit.__dict__[model_name](
         img_size=[crop_size],
         patch_size=patch_size)
@@ -82,6 +82,10 @@ def init_model(
         predictor_embed_dim=pred_emb_dim,
         depth=pred_depth,
         num_heads=encoder.num_heads)
+    expander = vit.__dict__['expander'](
+        embed_dim=encoder.embed_dim,
+        norm_type='bn'
+    )
 
     def init_weights(m):
         if isinstance(m, torch.nn.Linear):
@@ -98,10 +102,16 @@ def init_model(
     for m in predictor.modules():
         init_weights(m)
 
+    for m in expander.modules():
+        init_weights(m)
+
     encoder.to(device)
     predictor.to(device)
-    logger.info(encoder)
-    return encoder, predictor
+    expander.to(device)
+    logger.info(f'encoder: {encoder}')
+    logger.info(f'predictor: {predictor}')
+    logger.info(f'expander: {expander}')
+    return encoder, predictor, expander
 
 
 def init_opt(

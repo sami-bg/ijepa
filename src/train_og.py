@@ -33,7 +33,7 @@ from src.masks.multiblock import MaskCollator as MBMaskCollator
 from src.masks.utils import apply_masks
 from src.utils.distributed import (
     init_distributed,
-    AllReduce, AllGather
+    AllReduce
 )
 from src.utils.logging import (
     CSVLogger,
@@ -120,21 +120,9 @@ def main(args, resume_preempt=False):
     start_lr = args['optimization']['start_lr']
     lr = args['optimization']['lr']
     final_lr = args['optimization']['final_lr']
-    # -- VICREG (C-JEPA)
-    enable_vicreg = args['optimization'].get('enable_vicreg', False)
-    vicreg_weight = args['optimization'].get('vicreg_weight', .001)
-    sim_weight = args['optimization'].get('sim_weight', 25.)
-    std_weight = args['optimization'].get('std_weight', 25.)
-    cov_weight = args['optimization'].get('cov_weight', 1.)
-    vicreg_epsilon = args['optimization'].get('vicreg_epsilon', 1e-4)
 
     # -- LOGGING
     folder = args['logging']['folder']
-    # -- create logging dir if it doesn't exist
-    if not os.path.exists(folder):
-        os.makedirs(folder, exist_ok=False)
-        logger.info(f'Created checkpoint directory: {folder}')
-
     tag = args['logging']['write_tag']
 
     dump = os.path.join(folder, 'params-ijepa.yaml')
@@ -168,12 +156,7 @@ def main(args, resume_preempt=False):
                            ('%.5f', 'loss'),
                            ('%.5f', 'mask-A'),
                            ('%.5f', 'mask-B'),
-                           ('%d', 'time (ms)'),
-                           ('%.5f', 'loss_vicreg'),
-                           ('%.5f', 'loss_std'),
-                           ('%.5f', 'loss_cov'),
-                           ('%.5f', 'loss_sim')
-                        )
+                           ('%d', 'time (ms)'))
 
     # -- init model
     encoder, predictor, expander = init_model(
@@ -265,9 +248,8 @@ def main(args, resume_preempt=False):
     def save_checkpoint(epoch):
         save_dict = {
             'encoder': encoder.state_dict(),
-            'target_encoder': target_encoder.state_dict(),
             'predictor': predictor.state_dict(),
-            'expander': expander.state_dict(),
+            'target_encoder': target_encoder.state_dict(),
             'opt': optimizer.state_dict(),
             'scaler': None if scaler is None else scaler.state_dict(),
             'epoch': epoch,
@@ -292,11 +274,6 @@ def main(args, resume_preempt=False):
         maskA_meter = AverageMeter()
         maskB_meter = AverageMeter()
         time_meter = AverageMeter()
-        loss_jepa_meter = AverageMeter()
-        loss_vicreg_meter = AverageMeter()
-        loss_std_meter = AverageMeter()
-        loss_cov_meter = AverageMeter()
-        loss_sim_meter = AverageMeter()
 
         for itr, (udata, masks_enc, masks_pred) in enumerate(unsupervised_loader):
 
@@ -316,13 +293,6 @@ def main(args, resume_preempt=False):
                 # --
 
                 def forward_target():
-                    """
-                    Encodes the image into a target encoding, then applies the masks_pred to 
-                    get the target patches that the predictor will predict.
-
-                    Then, it repeats the target patches for the number of context patches.
-                    Usually, there are 4 target patches, and 1 context patch. 
-                    """
                     with torch.no_grad():
                         h = target_encoder(imgs)
                         h = F.layer_norm(h, (h.size(-1),))  # normalize over feature-dim
@@ -333,89 +303,20 @@ def main(args, resume_preempt=False):
                         return h
 
                 def forward_context():
-                    """
-                    Given the image, mask it and then encode whatever was not masked into a "context" encoding.
-                    Then, the predictor takes: 
-                        - context encoding,
-                        - context encoding mask (informs it where in the image the context is)
-                        - target encoding masks (informs it where in the image we want to predict)
-                    And outputs the predicted patches
-                    """
-                    zc = encoder(imgs, masks_enc)
-                    return zc
+                    z = encoder(imgs, masks_enc)
+                    z = predictor(z, masks_enc, masks_pred)
+                    return z
 
-                def forward_predictor():
-                    zp = predictor(zc, masks_enc, masks_pred)
-                    return zp
-                
-                def forward_expander(zx):
-                    # expand on patch-level dimension mean
-                    zx_expanded = expander(zx.mean(dim=1))
-                    return zx_expanded
-
-                def vicreg_loss_fn(h_expanded, zp_expanded):
-                    def std_term(zp):
-                        std = torch.sqrt(zp.var(dim=0) + vicreg_epsilon)
-                        return torch.mean(F.relu(1 - std))
-                    
-                    def off_diagonal(x: torch.Tensor):
-                        n, *_ = x.shape
-                        return x.flatten()[:-1].view(n - 1, n + 1)[:, 1:].flatten()
-                    
-                    def covariance_term(zp):
-                        zc_centered = zp - zp.mean(dim=0)
-                        cov_zc = (zc_centered.T @ zc_centered) / (zp.size(0) - 1)
-                        cov_loss = off_diagonal(cov_zc).pow(2).sum() / zp.size(1)
-                        return cov_loss
-
-                    def sim_loss_fn(zp_expanded, h_expanded):
-                        return F.mse_loss(zp_expanded, h_expanded)
-
-                    # For each pair of patch_avgs that aren't the same,
-                    # compute vicreg
-                    loss_sim    = (sim_weight * sim_loss_fn(zp_expanded, h_expanded))
-
-                    zp_expanded = AllGather.apply(zp_expanded)
-                    h_expanded  = AllGather.apply(h_expanded)
-                    # -- covariance
-                    loss_cov     = (cov_weight * covariance_term(zp_expanded))
-                    loss_cov    += (cov_weight * covariance_term(h_expanded))
-                    # -- variance. vicreg paper uses the 0.5 factor https://github.com/facebookresearch/vicreg/blob/main/main_vicreg.py#L207
-                    loss_std     = 0.5 * (std_weight * std_term(zp_expanded))
-                    loss_std    += 0.5 * (std_weight * std_term(h_expanded))
-
-                    loss_vicreg = loss_std + loss_cov + loss_sim
-                    loss_vicreg *= vicreg_weight
-
-                    return loss_vicreg, loss_std, loss_cov, loss_sim
-
-                def jepa_loss_fn(zp, h):
-                    # z: predicted patches, h: target patches
-                    jepa_loss = F.smooth_l1_loss(zp, h)
-                    return jepa_loss
+                def loss_fn(z, h):
+                    loss = F.smooth_l1_loss(z, h)
+                    loss = AllReduce.apply(loss)
+                    return loss
 
                 # Step 1. Forward
                 with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=use_bfloat16):
-                    h   = forward_target()
-                    zc  = forward_context()
-                    zp  = forward_predictor()
-
-                    loss = jepa_loss_fn(zp, h)
-                    loss_jepa_meter.update(loss)
-
-                    if enable_vicreg:
-                        zp_expanded = forward_expander(zp)
-                        h_expanded  = forward_expander(h)
-                        
-                        loss_vicreg, loss_std, loss_cov, loss_sim = vicreg_loss_fn(h_expanded, zp_expanded)
-                        loss += loss_vicreg
-                        # -- for logging
-                        loss_vicreg_meter.update(loss_vicreg)
-                        loss_std_meter.update(loss_std)
-                        loss_cov_meter.update(loss_cov)
-                        loss_sim_meter.update(loss_sim)
-
-                loss = AllReduce.apply(loss)
+                    h = forward_target()
+                    z = forward_context()
+                    loss = loss_fn(z, h)
 
                 #  Step 2. Backward & step
                 if use_bfloat16:
@@ -439,17 +340,15 @@ def main(args, resume_preempt=False):
             loss_meter.update(loss)
             time_meter.update(etime)
 
-
             # -- Logging
             def log_stats():
                 csv_logger.log(epoch + 1, itr, loss, maskA_meter.val, maskB_meter.val, etime)
                 if (itr % log_freq == 0) or np.isnan(loss) or np.isinf(loss):
-                    logger.info('[%d, %5d] loss: %.5f '
+                    logger.info('[%d, %5d] loss: %.3f '
                                 'masks: %.1f %.1f '
                                 '[wd: %.2e] [lr: %.2e] '
                                 '[mem: %.2e] '
-                                '(%.1f ms) '
-                                'jepa: %.5f vicreg: %.5f std: %.5f cov: %.5f sim: %.5f'
+                                '(%.1f ms)'
                                 % (epoch + 1, itr,
                                    loss_meter.avg,
                                    maskA_meter.avg,
@@ -457,12 +356,7 @@ def main(args, resume_preempt=False):
                                    _new_wd,
                                    _new_lr,
                                    torch.cuda.max_memory_allocated() / 1024.**2,
-                                   time_meter.avg,
-                                   loss_jepa_meter.avg,
-                                   loss_vicreg_meter.avg,
-                                   loss_std_meter.avg,
-                                   loss_cov_meter.avg,
-                                   loss_sim_meter.avg))
+                                   time_meter.avg))
 
                     if grad_stats is not None:
                         logger.info('[%d, %5d] grad_stats: [%.2e %.2e] (%.2e, %.2e)'

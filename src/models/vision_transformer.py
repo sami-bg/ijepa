@@ -217,6 +217,43 @@ class ConvEmbed(nn.Module):
         return p.flatten(2).transpose(1, 2)
 
 
+class Expander(nn.Module):
+    """
+    VICReg-style projector
+    Architecture: Linear → BN → ReLU (repeated num_layers-1 times) → Linear (final)
+    """
+    def __init__(
+        self,
+        embed_dim: int,
+        expander_dim: int = 8192,
+        num_layers: int = 3,
+        norm_type: str = 'bn'    
+    ):
+        super().__init__()
+        
+        layers = []
+        in_dim = embed_dim
+        
+        # Hidden layers: Linear → BN/LN → ReLU
+        for _ in range(num_layers - 1):
+            layers.extend([
+                nn.Linear(in_dim, expander_dim),
+                nn.BatchNorm1d(expander_dim) if norm_type == 'bn' 
+                    else nn.LayerNorm(expander_dim),
+                nn.ReLU(inplace=True)
+            ])
+            in_dim = expander_dim  # Subsequent layers use expander_dim
+        
+        # Final layer: Linear only (no BN/ReLU, bias=False)
+        layers.append(nn.Linear(expander_dim, expander_dim, bias=False))
+        
+        self.net = nn.Sequential(*layers)
+
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
 class VisionTransformerPredictor(nn.Module):
     """ Vision Transformer """
     def __init__(
@@ -439,6 +476,12 @@ class VisionTransformer(nn.Module):
         )
         pos_embed = pos_embed.permute(0, 2, 3, 1).view(1, -1, dim)
         return torch.cat((class_emb.unsqueeze(0), pos_embed), dim=1)
+
+
+# c-jepa & vicreg
+def expander(embed_dim, **kwargs):
+    model = Expander(embed_dim=embed_dim, **kwargs)
+    return model
 
 
 def vit_predictor(**kwargs):

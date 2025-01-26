@@ -37,11 +37,12 @@ def process_main(rank, fname, world_size, devices):
     else:
         logger.setLevel(logging.ERROR)
 
-    logger.info(f'called-params {fname}')
-
+    fname_path = '/home/sboughanem/ssl/cs2952x/ijepa/configs/'+fname
+    logger.info(f'called-params {fname}, {fname_path}')
+    
     # -- load script params
     params = None
-    with open(fname, 'r') as y_file:
+    with open(fname_path, 'r') as y_file:
         params = yaml.load(y_file, Loader=yaml.FullLoader)
         logger.info('loaded params...')
         pp = pprint.PrettyPrinter(indent=4)
@@ -53,13 +54,18 @@ def process_main(rank, fname, world_size, devices):
 
 
 if __name__ == '__main__':
+    import sys
+    sys.argv[1:] = ['--fname', 'in1k_vitt16_ep300.yaml', '--devices', 'cuda:0']
+
     args = parser.parse_args()
 
     num_gpus = len(args.devices)
     mp.set_start_method('spawn')
 
-    for rank in range(num_gpus):
-        mp.Process(
-            target=process_main,
-            args=(rank, args.fname, num_gpus, args.devices)
-        ).start()
+    process_main(0, args.fname, num_gpus, args.devices)
+
+    # for rank in range(num_gpus):
+    #     mp.Process(
+    #         target=process_main,
+    #         args=(rank, args.fname, num_gpus, args.devices)
+    #     ).start()
